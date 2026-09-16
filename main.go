@@ -18,23 +18,41 @@ import (
 var Debug bool
 
 func main() {
-	if len(os.Args) < 2 {
+	tcpAddr := ""
+	args := os.Args[1:]
+
+	// Extract --tcp HOST:PORT from args before mode routing.
+	// Works in both proxy and attach modes.
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--tcp" {
+			if i+1 < len(args) {
+				tcpAddr = args[i+1]
+				args = append(args[:i], args[i+2:]...)
+				break
+			}
+		}
+	}
+
+	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "usage:\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex <agent-command> [args...]   Start proxy with agent\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex attach <socket-path>        Connect stdio to existing proxy\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex [--tcp host:port] <agent-command> [args...]   Start proxy with agent\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex attach [--tcp host:port|<socket-path>]        Connect stdio to existing proxy\n")
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
 	case "attach":
-		runAttach()
+		runAttach(tcpAddr, args[1:])
 	default:
-		runProxy()
+		runProxy(tcpAddr, args)
 	}
 }
 
 // runProxy starts the agent subprocess and multiplexing proxy.
-func runProxy() {
+// tcpAddr, if set, makes the proxy also listen on a TCP address
+// (e.g. "100.x.x.x:9999") for secondary frontends over the network.
+// agentArgs is the agent command to spawn (everything after flags).
+func runProxy(tcpAddr string, agentArgs []string) {
 	// Set up debug logging to file
 	Debug = false
 	logDir := filepath.Join(socketDir(), "logs")
@@ -49,8 +67,6 @@ func runProxy() {
 	}
 
 	cleanStaleSockets()
-
-	agentArgs := os.Args[1:]
 
 	cmd := exec.Command(agentArgs[0], agentArgs[1:]...)
 	agentIn, err := cmd.StdinPipe()
@@ -92,8 +108,17 @@ func runProxy() {
 	if err != nil {
 		log.Fatalf("listen unix: %v", err)
 	}
-	defer os.Remove(sockPath)
 	fmt.Fprintf(os.Stderr, "acp-multiplex: socket %s, log %s/logs/%d.log\n", sockPath, socketDir(), os.Getpid())
+
+	// TCP listener for remote secondary frontends (optional)
+	var tcpLn net.Listener
+	if tcpAddr != "" {
+		tcpLn, err = net.Listen("tcp", tcpAddr)
+		if err != nil {
+			log.Fatalf("listen tcp %s: %v", tcpAddr, err)
+		}
+		fmt.Fprintf(os.Stderr, "acp-multiplex: tcp %s\n", tcpAddr)
+	}
 
 	nextID := 1
 	go func() {
@@ -109,11 +134,29 @@ func runProxy() {
 		}
 	}()
 
+	if tcpLn != nil {
+		go func() {
+			for {
+				conn, err := tcpLn.Accept()
+				if err != nil {
+					log.Printf("tcp accept: %v", err)
+					return
+				}
+				nextID++
+				f := NewSocketFrontend(nextID, conn)
+				proxy.AddFrontend(f)
+			}
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		os.Remove(sockPath)
+		if tcpLn != nil {
+			tcpLn.Close()
+		}
 		cmd.Process.Kill()
 		os.Exit(0)
 	}()
@@ -130,26 +173,40 @@ func runProxy() {
 			cmd.ProcessState.Pid(), cmd.ProcessState.ExitCode(), cmd.ProcessState.Sys())
 	}
 	ln.Close()
+	if tcpLn != nil {
+		tcpLn.Close()
+	}
 	os.Remove(sockPath)
 	os.Exit(0)
 }
 
-// runAttach bridges stdin/stdout to an existing proxy's Unix socket.
-// This lets stdio-only ACP clients (Toad, acp-ui) connect as secondary frontends.
-func runAttach() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage: acp-multiplex attach <socket-path>\n")
-		os.Exit(1)
-	}
-	sockPath := os.Args[2]
+// runAttach bridges stdin/stdout to an existing proxy.
+// With tcpAddr set, connects over TCP (e.g. "100.x.x.x:9999").
+// Otherwise expects a Unix socket path as the first positional arg.
+// This lets stdio-only ACP clients (Toad, acp-ui, agent-shell) connect
+// as secondary frontends to remote or local sessions.
+func runAttach(tcpAddr string, args []string) {
+	var conn net.Conn
+	var err error
 
-	conn, err := net.Dial("unix", sockPath)
-	if err != nil {
-		log.Fatalf("connect to %s: %v", sockPath, err)
+	if tcpAddr != "" {
+		conn, err = net.Dial("tcp", tcpAddr)
+		if err != nil {
+			log.Fatalf("connect to tcp %s: %v", tcpAddr, err)
+		}
+	} else {
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "usage: acp-multiplex attach <socket-path>\n")
+			os.Exit(1)
+		}
+		conn, err = net.Dial("unix", args[0])
+		if err != nil {
+			log.Fatalf("connect to %s: %v", args[0], err)
+		}
 	}
 	defer conn.Close()
 
-	// Bidirectional pipe: stdin -> socket, socket -> stdout
+	// Bidirectional pipe: stdin -> conn, conn -> stdout
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(conn, os.Stdin); done <- struct{}{} }()
 	go func() { io.Copy(os.Stdout, conn); done <- struct{}{} }()
