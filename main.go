@@ -17,6 +17,41 @@ import (
 
 var Debug bool
 
+const usageText = `acp-multiplex - run one ACP agent behind several frontends
+
+usage:
+  acp-multiplex [--tcp host:port] <agent-command> [args...]
+        Start the agent and proxy it. The primary frontend speaks ACP on
+        stdin/stdout; further frontends attach over a unix socket, and over
+        TCP as well when --tcp is given.
+
+  acp-multiplex attach [--tcp host:port | <socket-path>]
+        Connect stdin/stdout to an already-running proxy as a secondary
+        frontend, replaying the session so far.
+
+options:
+  --tcp host:port   listen on (proxy) or dial (attach) a TCP address
+  -h, --help        print this help
+
+examples:
+  acp-multiplex claude-agent-acp
+  acp-multiplex --tcp 100.64.0.10:19994 pi-acp
+  acp-multiplex attach --tcp 100.64.0.10:19994
+`
+
+func usage(w io.Writer) { fmt.Fprint(w, usageText) }
+
+// fatalf reports a startup failure on stderr as well as in the log file.
+// runProxy points the logger at a per-pid file before anything that can
+// fail, so log.Fatalf there is invisible: the process exits 1 with silent
+// output and the ACP client just sees an agent that never started.
+func fatalf(format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintf(os.Stderr, "acp-multiplex: %s\n", msg)
+	log.Printf("fatal: %s", msg)
+	os.Exit(1)
+}
+
 func main() {
 	tcpAddr := ""
 	args := os.Args[1:]
@@ -25,18 +60,36 @@ func main() {
 	// Works in both proxy and attach modes.
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--tcp" {
-			if i+1 < len(args) {
-				tcpAddr = args[i+1]
-				args = append(args[:i], args[i+2:]...)
-				break
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "acp-multiplex: --tcp needs a host:port value\n\n")
+				usage(os.Stderr)
+				os.Exit(1)
 			}
+			tcpAddr = args[i+1]
+			args = append(args[:i], args[i+2:]...)
+			break
 		}
 	}
 
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "usage:\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex [--tcp host:port] <agent-command> [args...]   Start proxy with agent\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex attach [--tcp host:port|<socket-path>]        Connect stdio to existing proxy\n")
+		usage(os.Stderr)
+		os.Exit(1)
+	}
+
+	// Only args[0] is ours to interpret; everything after the agent command
+	// belongs to the agent, so `acp-multiplex some-agent -h` still reaches
+	// some-agent.
+	if args[0] == "-h" || args[0] == "--help" {
+		usage(os.Stdout)
+		os.Exit(0)
+	}
+
+	// A leftover dash here is a mistyped option, not an agent. Without this
+	// it goes to exec.Command as the binary to run and fails where nobody
+	// is looking.
+	if strings.HasPrefix(args[0], "-") {
+		fmt.Fprintf(os.Stderr, "acp-multiplex: unknown option %q\n\n", args[0])
+		usage(os.Stderr)
 		os.Exit(1)
 	}
 
@@ -71,16 +124,16 @@ func runProxy(tcpAddr string, agentArgs []string) {
 	cmd := exec.Command(agentArgs[0], agentArgs[1:]...)
 	agentIn, err := cmd.StdinPipe()
 	if err != nil {
-		log.Fatalf("agent stdin pipe: %v", err)
+		fatalf("agent stdin pipe: %v", err)
 	}
 	agentOut, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatalf("agent stdout pipe: %v", err)
+		fatalf("agent stdout pipe: %v", err)
 	}
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("start agent: %v", err)
+		fatalf("start agent %q: %v", agentArgs[0], err)
 	}
 
 	cache := NewCache()
@@ -106,7 +159,7 @@ func runProxy(tcpAddr string, agentArgs []string) {
 	sockPath := socketPath()
 	ln, err := listenUnix(sockPath)
 	if err != nil {
-		log.Fatalf("listen unix: %v", err)
+		fatalf("listen unix %s: %v", sockPath, err)
 	}
 	fmt.Fprintf(os.Stderr, "acp-multiplex: socket %s, log %s/logs/%d.log\n", sockPath, socketDir(), os.Getpid())
 
@@ -115,7 +168,7 @@ func runProxy(tcpAddr string, agentArgs []string) {
 	if tcpAddr != "" {
 		tcpLn, err = net.Listen("tcp", tcpAddr)
 		if err != nil {
-			log.Fatalf("listen tcp %s: %v", tcpAddr, err)
+			fatalf("listen tcp %s: %v", tcpAddr, err)
 		}
 		fmt.Fprintf(os.Stderr, "acp-multiplex: tcp %s\n", tcpAddr)
 	}
@@ -192,16 +245,17 @@ func runAttach(tcpAddr string, args []string) {
 	if tcpAddr != "" {
 		conn, err = net.Dial("tcp", tcpAddr)
 		if err != nil {
-			log.Fatalf("connect to tcp %s: %v", tcpAddr, err)
+			fatalf("connect to tcp %s: %v", tcpAddr, err)
 		}
 	} else {
 		if len(args) < 1 {
-			fmt.Fprintf(os.Stderr, "usage: acp-multiplex attach <socket-path>\n")
+			fmt.Fprintf(os.Stderr, "acp-multiplex: attach needs --tcp host:port or a socket path\n\n")
+			usage(os.Stderr)
 			os.Exit(1)
 		}
 		conn, err = net.Dial("unix", args[0])
 		if err != nil {
-			log.Fatalf("connect to %s: %v", args[0], err)
+			fatalf("connect to %s: %v", args[0], err)
 		}
 	}
 	defer conn.Close()
